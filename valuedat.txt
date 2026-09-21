@@ -1,0 +1,311 @@
+using Microsoft.AspNetCore.Mvc;
+using SalesforcAPI.Interfaces;
+using SalesforcAPI.Models;
+using System;
+using System.Threading.Tasks;
+
+namespace SalesforcAPI.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class ValidateDataController : ControllerBase
+    {
+        private readonly IValidateDataRepository _validateDataRepository;
+        private readonly ILogger<ValidateDataController> _logger;
+
+        public ValidateDataController(
+            IValidateDataRepository validateDataRepository,
+            ILogger<ValidateDataController> logger)
+        {
+            _validateDataRepository = validateDataRepository;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Validates an IDCard and returns the related PolicyIDs and cellular phone number.
+        /// </summary>
+        [HttpPost]
+        public async Task<ActionResult<ValidateDataResponse>> Post([FromBody] ValidateDataRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.IDCard))
+            {
+                return BadRequest(new ValidateDataResponse
+                {
+                    Data = new ValidateDataResult
+                    {
+                        ValidationResult = "Data is not valid"
+                    },
+                    Result = "Failed",
+                    Message = "IDCard is required"
+                });
+            }
+
+            var idCard = request.IDCard.Trim();
+
+            try
+            {
+                var data = await _validateDataRepository.ValidateDataAsync(idCard);
+
+                if (data == null)
+                {
+                    return NotFound(new ValidateDataResponse
+                    {
+                        Data = new ValidateDataResult
+                        {
+                            ValidationResult = "Data is not valid"
+                        },
+                        Result = "Failed",
+                        Message = "IDCard not found"
+                    });
+                }
+
+                var response = new ValidateDataResponse
+                {
+                    Data = data,
+                    Result = data.PolicyId.Count > 0 ? "Success" : "Failed",
+                    Message = data.PolicyId.Count > 0 ? "Validation Success" : "Validation Failed"
+                };
+
+                return Ok(response);
+            }
+            catch (TimeoutException ex)
+            {
+                _logger.LogError(ex, "Timeout validating IDCard={IDCard}", idCard);
+                return StatusCode(504, new ValidateDataResponse
+                {
+                    Result = "Failed",
+                    Message = "Request timed out"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error validating IDCard={IDCard}", idCard);
+                return StatusCode(500, new ValidateDataResponse
+                {
+                    Result = "Failed",
+                    Message = "Internal server error"
+                });
+            }
+        }
+    }
+}
+
+
+using SalesforcAPI.Models;
+using System.Threading.Tasks;
+
+namespace SalesforcAPI.Interfaces
+{
+    public interface IValidateDataRepository
+    {
+        Task<ValidateDataResult?> ValidateDataAsync(string idCard);
+    }
+}
+
+
+using System.Collections.Generic;
+
+namespace SalesforcAPI.Models
+{
+    public class ValidateDataRequest
+    {
+        public string IDCard { get; set; } = string.Empty;
+    }
+
+    public class ValidateDataResult
+    {
+        public string ValidationResult { get; set; } = string.Empty;
+
+        public int IsMultiplePolicy { get; set; }
+
+        public string CellularPhoneNumber { get; set; } = string.Empty;
+
+        public List<string> PolicyId { get; set; } = new();
+    }
+
+    public class ValidateDataResponse
+    {
+        public ValidateDataResult Data { get; set; } = new();
+
+        public string Result { get; set; } = string.Empty;
+
+        public string Message { get; set; } = string.Empty;
+    }
+}
+
+
+using Dapper;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Caching.Memory;
+using SalesforcAPI.Interfaces;
+using SalesforcAPI.Models;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace SalesforcAPI.Repositories
+{
+    /// <summary>
+    /// ValidateDataRepository - Validates an IDCard (CLI_ID_TXT) against policy data
+    /// and returns all related PolicyIDs along with the cellular phone number.
+    /// </summary>
+    public class ValidateDataRepository : IValidateDataRepository
+    {
+        private readonly string _connectionString;
+        private readonly ILogger<ValidateDataRepository> _logger;
+        private readonly IMemoryCache _cache;
+        private readonly TimeSpan _cacheDuration = TimeSpan.FromMinutes(5);
+
+        public ValidateDataRepository(
+            IConfiguration configuration,
+            ILogger<ValidateDataRepository> logger,
+            IMemoryCache cache)
+        {
+            _connectionString = configuration.GetConnectionString("NDIBOARD33")
+                ?? throw new ArgumentNullException(nameof(configuration), "Connection string NDIBOARD33 not found.");
+            _logger = logger;
+            _cache = cache;
+        }
+
+        public async Task<ValidateDataResult?> ValidateDataAsync(string idCard)
+        {
+            var sw = Stopwatch.StartNew();
+
+            if (string.IsNullOrWhiteSpace(idCard))
+                throw new ArgumentException("IDCard cannot be null or empty", nameof(idCard));
+
+            var cacheKey = $"ValidateData_{idCard}";
+
+            if (_cache.TryGetValue<ValidateDataResult>(cacheKey, out var cachedResult))
+            {
+                _logger.LogInformation("Cache HIT IDCard={IDCard} Time={Elapsed}ms",
+                    idCard, sw.ElapsedMilliseconds);
+                return cachedResult;
+            }
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                await connection.OpenAsync();
+
+                const string sql = @"
+WITH DistinctPolicies AS
+(
+    SELECT DISTINCT
+        CL.[CLI_ID],
+        CL.CLI_ID_TXT,
+        PC.[POL_ID]
+    FROM [DWM_CLIENT_SF] CL
+    INNER JOIN [DWA_POLICY_CLIENT] PC ON PC.[CLI_ID] = CL.[CLI_ID]
+    WHERE CL.CLI_ID_TXT = @IDCard
+      AND PC.[POL_CLI_REL_TYP_CD] = 'P'
+),
+PolicyData AS
+(
+    SELECT
+        [CLI_ID],
+        MAX([CLI_ID_TXT]) AS CLI_ID_TXT,
+        COUNT(*) AS IsMultiplePolicy,
+        STRING_AGG(CONVERT(varchar(max), [POL_ID]), ',') AS PolicyId
+    FROM DistinctPolicies
+    GROUP BY [CLI_ID]
+),
+ContactData AS
+(
+    SELECT
+        [CLI_ID],
+        MAX(ISNULL([CLI_CNTCT_ID_TXT], '')) AS CellularPhoneNumber
+    FROM DWA_CLIENT_CONTACT_SF
+    GROUP BY [CLI_ID]
+)
+SELECT
+    P.IsMultiplePolicy,
+    P.[CLI_ID],
+    P.CLI_ID_TXT,
+    ISNULL(C.CellularPhoneNumber, '') AS CellularPhoneNumber,
+    P.PolicyId
+FROM PolicyData P
+LEFT JOIN ContactData C ON C.[CLI_ID] = P.[CLI_ID];";
+
+                var row = await connection.QueryFirstOrDefaultAsync<ValidateDataRow>(
+                    sql,
+                    new { IDCard = idCard },
+                    commandTimeout: 60);
+
+                if (row == null)
+                {
+                    sw.Stop();
+                    _logger.LogWarning("IDCard NOT FOUND IDCard={IDCard} Time={Elapsed}ms",
+                        idCard, sw.ElapsedMilliseconds);
+                    return null;
+                }
+
+                var policyIds = string.IsNullOrWhiteSpace(row.PolicyId)
+                    ? new List<string>()
+                    : row.PolicyId.Split(',', StringSplitOptions.RemoveEmptyEntries).ToList();
+
+                var result = new ValidateDataResult
+                {
+                    CellularPhoneNumber = row.CellularPhoneNumber,
+                    PolicyId = policyIds,
+                    IsMultiplePolicy = row.IsMultiplePolicy > 1 ? 1 : 0,
+                    ValidationResult = policyIds.Count > 0 ? "Data is valid" : "Data is not valid"
+                };
+
+                if (policyIds.Count > 0)
+                {
+                    var cacheOptions = new MemoryCacheEntryOptions()
+                        .SetSlidingExpiration(_cacheDuration)
+                        .SetAbsoluteExpiration(TimeSpan.FromMinutes(15))
+                        .SetPriority(CacheItemPriority.High);
+
+                    _cache.Set(cacheKey, result, cacheOptions);
+                }
+
+                sw.Stop();
+                _logger.LogInformation(
+                    "ValidateData OK IDCard={IDCard} PolicyCount={PolicyCount} Time={Elapsed}ms",
+                    idCard, policyIds.Count, sw.ElapsedMilliseconds);
+
+                return result;
+            }
+            catch (SqlException sqlEx) when (sqlEx.Number == -2)
+            {
+                sw.Stop();
+                _logger.LogError(sqlEx,
+                    "SQL TIMEOUT IDCard={IDCard} Time={Elapsed}ms",
+                    idCard, sw.ElapsedMilliseconds);
+                throw new TimeoutException($"Database timeout for IDCard '{idCard}'", sqlEx);
+            }
+            catch (SqlException sqlEx)
+            {
+                sw.Stop();
+                _logger.LogError(sqlEx,
+                    "SQL ERROR IDCard={IDCard} ErrorCode={ErrorCode} Time={Elapsed}ms",
+                    idCard, sqlEx.Number, sw.ElapsedMilliseconds);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                _logger.LogError(ex,
+                    "UNEXPECTED ERROR IDCard={IDCard} Type={ExceptionType} Time={Elapsed}ms",
+                    idCard, ex.GetType().Name, sw.ElapsedMilliseconds);
+                throw;
+            }
+        }
+
+        private sealed class ValidateDataRow
+        {
+            public int IsMultiplePolicy { get; set; }
+
+            public string CellularPhoneNumber { get; set; } = string.Empty;
+
+            public string PolicyId { get; set; } = string.Empty;
+        }
+    }
+}
