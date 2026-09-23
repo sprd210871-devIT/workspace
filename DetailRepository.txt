@@ -1,0 +1,243 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.SqlClient;
+using SalesforcAPI.Interfaces;
+using SalesforcAPI.Models;
+using System;
+using System.Threading.Tasks;
+
+namespace SalesforcAPI.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class PremiumAndPaymentDetailController : ControllerBase
+    {
+        private readonly IPremiumAndPaymentDetailRepository _repository;
+        private readonly ILogger<PremiumAndPaymentDetailController> _logger;
+
+        public PremiumAndPaymentDetailController(
+            IPremiumAndPaymentDetailRepository repository,
+            ILogger<PremiumAndPaymentDetailController> logger)
+        {
+            _repository = repository;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Gets premium and payment details (status, frequency, due date, amount, last payment status) for a policy.
+        /// </summary>
+        [HttpPost]
+        public async Task<ActionResult<PremiumAndPaymentDetailResponse>> Post([FromBody] PremiumAndPaymentDetailRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.PolicyID))
+            {
+                return BadRequest(new PremiumAndPaymentDetailResponse
+                {
+                    Result = "Failed",
+                    Message = "PolicyID is required"
+                });
+            }
+
+            var policyId = request.PolicyID.Trim();
+
+            try
+            {
+                var data = await _repository.GetPremiumAndPaymentDetailAsync(policyId);
+
+                if (data == null)
+                {
+                    return NotFound(new PremiumAndPaymentDetailResponse
+                    {
+                        Result = "Failed",
+                        Message = "PolicyID not found"
+                    });
+                }
+
+                return Ok(new PremiumAndPaymentDetailResponse
+                {
+                    Data = data,
+                    Result = "Success",
+                    Message = "Get Data Success"
+                });
+            }
+            catch (TimeoutException ex)
+            {
+                _logger.LogError(ex, "Timeout fetching premium/payment detail PolicyID={PolicyID}", policyId);
+                return StatusCode(504, new PremiumAndPaymentDetailResponse
+                {
+                    Result = "Failed",
+                    Message = "Request timed out"
+                });
+            }
+            catch (SqlException ex)
+            {
+                _logger.LogError(ex, "Database error fetching premium/payment detail PolicyID={PolicyID}", policyId);
+                return StatusCode(500, new PremiumAndPaymentDetailResponse
+                {
+                    Result = "Failed",
+                    Message = "Internal server error"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error fetching premium/payment detail PolicyID={PolicyID}", policyId);
+                return StatusCode(500, new PremiumAndPaymentDetailResponse
+                {
+                    Result = "Failed",
+                    Message = "Internal server error"
+                });
+            }
+        }
+    }
+}
+
+--------------
+using SalesforcAPI.Models;
+using System.Threading.Tasks;
+
+namespace SalesforcAPI.Interfaces
+{
+    public interface IPremiumAndPaymentDetailRepository
+    {
+        Task<PremiumAndPaymentDetailResult?> GetPremiumAndPaymentDetailAsync(string policyId);
+    }
+}
+--------------------
+
+using System;
+
+namespace SalesforcAPI.Models
+{
+    public class PremiumAndPaymentDetailRequest
+    {
+        public string PolicyID { get; set; } = string.Empty;
+    }
+
+    public class PremiumAndPaymentDetailResult
+    {
+        public string PolicyStatus { get; set; } = string.Empty;
+
+        public string PaymentFrequency { get; set; } = string.Empty;
+
+        public DateTime PaymentDueDate { get; set; }
+
+        public decimal PremiumAmount { get; set; }
+
+        public string LastPaymentStatus { get; set; } = string.Empty;
+    }
+
+    public class PremiumAndPaymentDetailResponse
+    {
+        public PremiumAndPaymentDetailResult? Data { get; set; }
+
+        public string Result { get; set; } = string.Empty;
+
+        public string Message { get; set; } = string.Empty;
+    }
+}
+
+----------------------------------
+using Dapper;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using SalesforcAPI.Interfaces;
+using SalesforcAPI.Models;
+using System;
+using System.Diagnostics;
+using System.Threading.Tasks;
+
+namespace SalesforcAPI.Repositories
+{
+    /// <summary>
+    /// PremiumAndPaymentDetailRepository - retrieves premium and payment status for a policy.
+    /// </summary>
+    public class PremiumAndPaymentDetailRepository : IPremiumAndPaymentDetailRepository
+    {
+        private readonly string _connectionString;
+        private readonly ILogger<PremiumAndPaymentDetailRepository> _logger;
+        private readonly IMemoryCache _cache;
+        private readonly TimeSpan _cacheDuration = TimeSpan.FromMinutes(5);
+
+        public PremiumAndPaymentDetailRepository(
+            IConfiguration configuration,
+            ILogger<PremiumAndPaymentDetailRepository> logger,
+            IMemoryCache cache)
+        {
+            _connectionString = configuration.GetConnectionString("NDIBOARD33")
+                ?? throw new ArgumentNullException(nameof(configuration), "Connection string NDIBOARD33 not found.");
+            _logger = logger;
+            _cache = cache;
+        }
+
+        public async Task<PremiumAndPaymentDetailResult?> GetPremiumAndPaymentDetailAsync(string policyId)
+        {
+            var sw = Stopwatch.StartNew();
+
+            if (string.IsNullOrWhiteSpace(policyId))
+                throw new ArgumentException("PolicyID cannot be null or empty", nameof(policyId));
+
+            var cacheKey = $"PremiumAndPaymentDetail_{policyId}";
+
+            if (_cache.TryGetValue<PremiumAndPaymentDetailResult>(cacheKey, out var cachedResult))
+            {
+                _logger.LogInformation("Cache HIT PolicyID={PolicyID} Time={Elapsed}ms",
+                    policyId, sw.ElapsedMilliseconds);
+                return cachedResult;
+            }
+
+            try
+            {
+                using var connection = new SqlConnection(_connectionString);
+                await connection.OpenAsync();
+
+                const string sql = @"
+SELECT
+    ISNULL(PI.POL_CSTAT_CD, '') AS PolicyStatus,
+    ISNULL(PI.POL_BILL_MODE_CD, '') AS PaymentFrequency,
+    PI.POL_BILL_TO_DT_NUM AS PaymentDueDate,
+    ISNULL(PI.POL_TRU_PREM_AMT, 0) AS PremiumAmount,
+    CASE
+        WHEN PI.POL_PD_TO_DT_NUM >= PI.POL_BILL_TO_DT_NUM THEN 'Paid'
+        ELSE 'Unpaid'
+    END AS LastPaymentStatus
+FROM [DWM_POLICY_INFO] PI WITH (NOLOCK)
+WHERE PI.[POL_ID] = @PolicyID
+OPTION (MAXDOP 4);";
+
+                var result = await connection.QueryFirstOrDefaultAsync<PremiumAndPaymentDetailResult>(
+                    sql,
+                    new { PolicyID = policyId },
+                    commandTimeout: 30);
+
+                if (result == null)
+                {
+                    sw.Stop();
+                    _logger.LogWarning("Premium/payment detail NOT FOUND PolicyID={PolicyID} Time={Elapsed}ms",
+                        policyId, sw.ElapsedMilliseconds);
+                    return null;
+                }
+
+                var cacheOptions = new MemoryCacheEntryOptions()
+                    .SetSlidingExpiration(_cacheDuration)
+                    .SetAbsoluteExpiration(TimeSpan.FromHours(1))
+                    .SetPriority(CacheItemPriority.High);
+
+                _cache.Set(cacheKey, result, cacheOptions);
+
+                sw.Stop();
+                _logger.LogInformation("Premium/payment detail retrieved PolicyID={PolicyID} Time={Elapsed}ms",
+                    policyId, sw.ElapsedMilliseconds);
+
+                return result;
+            }
+            catch (SqlException sqlEx)
+            {
+                sw.Stop();
+                _logger.LogError(sqlEx, "Database error PolicyID={PolicyID} Time={Elapsed}ms",
+                    policyId, sw.ElapsedMilliseconds);
+                throw;
+            }
+        }
+    }
+}
